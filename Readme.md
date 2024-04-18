@@ -20,11 +20,11 @@ This tool automates the process of verifying email addresses extracted from cont
 bash python first_step.py
 ```
 This script installs `email_validator` Python package using pip.
-Now you are ready to run the `main.py`
+Now you are ready to run the `mainV1.5.py`
 
 ### Understanding the Code:
 
-The main script (`main.py`) performs the following tasks:
+The main script (`mainV1.5.py`) performs the following tasks:
 
   1. It reads input Excel files and extracts contact information columns such as first name, last name, company URL, and email pattern.
 
@@ -50,7 +50,7 @@ This code is designed to be improvable. If you encounter errors or have suggesti
 Check the error messages for specific details about the problem.
 Refer to the comments within the code (# symbol) for explanations of different functions.
 Consider the troubleshooting tips mentioned in the comments to address common errors (e.g., network issues, outdated libraries).
-You can modify the code (especially the `verify_email` function in `main.py`) to improve error handling or explore alternative email validation libraries like `yoyo` or `python-whois`.
+You can modify the code (especially the `verify_email` function in `mainV1.5.py`) to improve error handling or explore alternative email validation libraries like `yoyo` or `python-whois`.
 
 # Support:
 For any questions or assistance, please open an issue in the GitHub repository.
