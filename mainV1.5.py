@@ -1,25 +1,95 @@
-# Public Version 1.5 (V 1.5)
+# Public Version 2.0 (V 1.5)
 import os
-import pandas as pd
-from urllib.parse import urlparse
-from google.colab import files
-from tqdm.notebook import tqdm
-from datetime import date
 import re
+import time
+import random
+import logging
+import json
+import http.client
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from tqdm.notebook import tqdm
+from google.colab import files
+from nameparser import HumanName
+from urllib.parse import urlparse
+from rich.console import Console
+from rich.progress import Progress, TaskID
+from requests.exceptions import Timeout, RequestException
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Tuple, Optional, Set, Any, Union
 
-try:
-    from email_validator import validate_email, EmailNotValidError
-except ModuleNotFoundError:
-    print("Please go to the first cell and install the 'email_validator' dependency.")
+class EmailVerifier:
+    """A class to verify and generate email addresses based on patterns."""
+    def __init__(self, log_file: str = "email_validation.log", api_key: str = None):
+        """
+        Initialize the EmailVerifier class.
 
-# V 1.5
-def ask_for_email_validation():
-    while True:
-        response = input("Would you like to validate email addresses? (yes/no): ").lower()
-        if response in ['yes', 'no']:
-            return response == 'yes'
-        else:
-            print("Invalid response. Please enter 'yes' or 'no'.")
+        Args:
+            log_file: Path to the log file
+            api_key: Verimail.io API key
+        """
+        # Set up logging
+        self.logger = self._setup_logging(log_file)
+        self.visited_urls: Set[str] = set()  # Set to store visited URLs
+        self.console = Console()
+        # Ask if user wants to validate emails
+        self.validate_emails = self._ask_for_email_validation()
+        # Get API key if validation is requested
+        self.api_key = self._get_api_key() if self.validate_emails else None
+        # Standard email patterns
+        self.standard_patterns = [
+            "{first}.{last}",
+            "{first}{last}",
+            "{f}{last}",
+            "{first}{l}",
+            "{f}.{last}",
+            "{first}_{last}"
+        ]
+
+    def _setup_logging(self, log_file: str) -> logging.Logger:
+        """
+        Set up logging configuration.
+
+        Args:
+            log_file: Path to the log file
+
+        Returns:
+            Configured logger instance
+        """
+        logger = logging.getLogger("EmailVerifier")
+        logger.setLevel(logging.INFO)
+
+        # Create file handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+
+        # Create formatter and add it to the handler
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+
+        # Add handler to logger
+        logger.addHandler(file_handler)
+
+        return logger
+
+    def _ask_for_email_validation(self) -> bool:
+        """
+        Ask user if they want to validate emails.
+
+        Returns:
+            Boolean indicating whether to validate emails
+        """
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Please answer the following question:", total=1)
+            while True:
+                response = input("Would you like to validate email addresses using Verimail API? (yes/no): ").lower()
+                if response in ['yes', 'no']:
+                    progress.update(task, advance=1, description="[green]Question answered", total=1)
+                    return response == 'yes'
+                else:
+                    self.console.print("[red]Invalid response. Please enter 'yes' or 'no'.")
+ # V 1.5
 
 def generate_emails(first_name, last_name, company_url, pattern):
     # Adding protocol
