@@ -1,4 +1,5 @@
-# Public Version 2.0 
+# New version for test
+# Public Version 3.0
 import os
 import re
 import time
@@ -46,6 +47,8 @@ class EmailVerifier:
             "{f}.{last}",
             "{first}_{last}"
         ]
+        # Get exception names for verification skipping
+        self.exception_names = self._get_exception_names() if self.validate_emails else []
 
     def _setup_logging(self, log_file: str) -> logging.Logger:
         """
@@ -102,6 +105,31 @@ class EmailVerifier:
             api_key = input("Enter your Verimail.io API key: ")
             progress.update(task, advance=1, description="[green]API key received", total=1)
             return api_key
+            
+    def _get_exception_names(self) -> List[str]:
+        """
+        Get list of names to skip verification for.
+        
+        Returns:
+            List of full names to skip verification
+        """
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Would you like to add exception names to skip verification?", total=1)
+            response = input("Would you like to add exception names to skip verification? (yes/no): ").lower()
+            
+            if response == 'yes':
+                exceptions = []
+                self.console.print("[cyan]Enter full names (one per line). Enter a blank line when finished:")
+                while True:
+                    name = input()
+                    if not name:
+                        break
+                    exceptions.append(name.strip())
+                progress.update(task, advance=1, description=f"[green]Added {len(exceptions)} exception names", total=1)
+                return exceptions
+            else:
+                progress.update(task, advance=1, description="[green]No exceptions added", total=1)
+                return []
 
     def _extract_domain(self, company_url: str) -> str:
         """
@@ -141,7 +169,7 @@ class EmailVerifier:
             Generated email address
         """
         domain = self._extract_domain(company_url)
-        
+
         # Define a dictionary to map pattern placeholders to corresponding values
         placeholders = {
             '{first}': first_name.lower(),
@@ -174,23 +202,23 @@ class EmailVerifier:
 
         try:
             self.logger.info(f"Verifying email: {email}")
-            
+
             # Use Verimail.io API for verification
             conn = http.client.HTTPSConnection("api.verimail.io")
             url = f'/v3/verify?email={email}&key={self.api_key}'
-            
+
             # Add a random delay to avoid rate limiting
             time.sleep(random.uniform(0.5, 2))
-            
+
             conn.request("GET", url)
             res = conn.getresponse()
             datajs = res.read()
-            
+
             # Parse the response
             data = json.loads(datajs.decode("utf-8"))
-            
+
             self.logger.info(f"Verification result for {email}: {data['result']}")
-            
+
             # Return complete verification data
             return {
                 "valid": data.get('status') == 'success' and data.get('deliverable', False),
@@ -199,7 +227,7 @@ class EmailVerifier:
                 "result": data.get('result'),
                 "full_response": data
             }
-            
+
         except Exception as e:
             self.logger.error(f"Error verifying email {email}: {str(e)}")
             # Fallback to basic validation on error
@@ -298,6 +326,62 @@ class EmailVerifier:
             self.logger.error(f"Error extracting phone number for {company_url}: {str(e)}")
             return None
 
+    def _try_alternative_patterns(self, first_name: str, last_name: str, company_url: str, 
+                                current_pattern: str) -> Dict[str, Any]:
+        """
+        Try alternative email patterns if current pattern results in hardbounce.
+        
+        Args:
+            first_name: First name of the person
+            last_name: Last name of the person
+            company_url: URL of the company
+            current_pattern: Current pattern that failed
+            
+        Returns:
+            Dictionary with verification results and pattern attempts info
+        """
+        # Skip current pattern as it was already tried
+        alternative_patterns = [p for p in self.standard_patterns if p != current_pattern]
+        
+        # Track patterns attempted
+        attempted_patterns = [current_pattern]
+        attempts_count = 1
+        
+        self.logger.info(f"Trying alternative patterns for {first_name} {last_name} at {company_url}")
+        
+        # Try each alternative pattern
+        for pattern in alternative_patterns:
+            email = self.generate_emails(first_name, last_name, company_url, pattern)
+            verification_result = self.verify_email(email)
+            attempted_patterns.append(pattern)
+            attempts_count += 1
+            
+            # If we found a valid email, return it
+            if verification_result.get('valid', False) or \
+               verification_result.get('result') != 'hardbounce':
+                return {
+                    "email": email,
+                    "verification": verification_result,
+                    "pattern_used": pattern,
+                    "patterns_attempted": attempted_patterns,
+                    "attempts_count": attempts_count,
+                    "success": True
+                }
+                
+            # Add delay between attempts to avoid rate limiting
+            time.sleep(random.uniform(1, 2))
+        
+        # If we get here, all patterns failed
+        self.logger.warning(f"All email patterns failed for {first_name} {last_name} at {company_url}")
+        return {
+            "email": None,
+            "verification": None, 
+            "pattern_used": None,
+            "patterns_attempted": attempted_patterns,
+            "attempts_count": attempts_count,
+            "success": False
+        }
+
     def _process_row(self, row: pd.Series, index: int) -> Tuple[int, Dict[str, Any]]:
         """
         Process a single row from the dataframe.
@@ -324,13 +408,53 @@ class EmailVerifier:
             row['Pattern']
         )
 
+        # Check if this name is in exception list
+        if self.validate_emails and row['Full Name'] in self.exception_names:
+            self.logger.info(f"Skipping verification for exception name: {row['Full Name']}")
+            result['Email Verification'] = None
+            result['Verification Status'] = "skipped"
+            result['Deliverable'] = None
+            result['Verification Result'] = "Exception name"
+            result['Patterns Attempted'] = None
+            result['Patterns Count'] = None
         # Verify email
-        if self.validate_emails:
+        elif self.validate_emails:
             verification_result = self.verify_email(result['Email'])
+            
+            # If verification failed with hardbounce, try alternative patterns
+            if verification_result.get('result') == 'hardbounce':
+                self.logger.info(f"Hardbounce detected for {result['Email']}, trying alternative patterns")
+                
+                retry_result = self._try_alternative_patterns(
+                    name.first, 
+                    name.last, 
+                    row['Company URL'], 
+                    row['Pattern']
+                )
+                
+                if retry_result['success']:
+                    # Update with successful pattern
+                    result['Email'] = retry_result['email']
+                    verification_result = retry_result['verification']
+                    result['Pattern'] = retry_result['pattern_used']
+                
+                # Add retry information
+                result['Patterns Attempted'] = ', '.join(retry_result['patterns_attempted'])
+                result['Patterns Count'] = retry_result['attempts_count']
+            else:
+                # No retry needed
+                result['Patterns Attempted'] = row['Pattern']
+                result['Patterns Count'] = 1
+            
+            # Store verification results
             result['Email Verification'] = verification_result['valid']
             result['Verification Status'] = verification_result['status']
             result['Deliverable'] = verification_result['deliverable']
             result['Verification Result'] = verification_result['result']
+        else:
+            # If not validating emails
+            result['Patterns Attempted'] = row['Pattern']
+            result['Patterns Count'] = 1
 
         # Extract phone number
         result['Phone Number'] = self.extract_phone_number(row['Company URL'])
