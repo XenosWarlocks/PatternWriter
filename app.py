@@ -1,5 +1,6 @@
-# New version for test
-# Public Version 3.0
+# PatternWriter with Fixed Verimail API Integration
+# Public Version 3.4 - Verimail API Bug Fix Applied
+
 import os
 import re
 import time
@@ -13,7 +14,7 @@ from bs4 import BeautifulSoup
 from tqdm.notebook import tqdm
 from google.colab import files
 from nameparser import HumanName
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from rich.console import Console
 from rich.progress import Progress, TaskID
 from requests.exceptions import Timeout, RequestException
@@ -40,12 +41,15 @@ class EmailVerifier:
         self.api_key = self._get_api_key() if self.validate_emails else None
         # Standard email patterns
         self.standard_patterns = [
+            "{first}",
+            "{last}",
             "{first}.{last}",
             "{first}{last}",
             "{f}{last}",
             "{first}{l}",
             "{f}.{last}",
-            "{first}_{last}"
+            "{first}_{last}",
+            "{first}{middle}{last}"
         ]
         # Get exception names for verification skipping
         self.exception_names = self._get_exception_names() if self.validate_emails else []
@@ -62,6 +66,9 @@ class EmailVerifier:
         """
         logger = logging.getLogger("EmailVerifier")
         logger.setLevel(logging.INFO)
+
+        # Clear existing handlers to avoid duplicates
+        logger.handlers.clear()
 
         # Create file handler
         file_handler = logging.FileHandler(log_file)
@@ -105,18 +112,18 @@ class EmailVerifier:
             api_key = input("Enter your Verimail.io API key: ")
             progress.update(task, advance=1, description="[green]API key received", total=1)
             return api_key
-            
+
     def _get_exception_names(self) -> List[str]:
         """
         Get list of names to skip verification for.
-        
+
         Returns:
             List of full names to skip verification
         """
         with Progress() as progress:
             task = progress.add_task("[cyan]Would you like to add exception names to skip verification?", total=1)
             response = input("Would you like to add exception names to skip verification? (yes/no): ").lower()
-            
+
             if response == 'yes':
                 exceptions = []
                 self.console.print("[cyan]Enter full names (one per line). Enter a blank line when finished:")
@@ -151,16 +158,17 @@ class EmailVerifier:
         # Remove common subdomains
         remove_subdomains = ["www.", "developer.", "aws.", "ai."]
         for sub in remove_subdomains:
-          domain = domain.replace(sub, '')
+            domain = domain.replace(sub, '')
 
         return domain
 
-    def generate_emails(self, first_name: str, last_name: str, company_url: str, pattern: str) -> str:
+    def generate_emails(self, first_name: str, middle_name: str, last_name: str, company_url: str, pattern: str) -> str:
         """
         Generate email addresses based on pattern.
 
         Args:
             first_name: First name of the person
+            middle_name: Middle name of the person
             last_name: Last name of the person
             company_url: URL of the company
             pattern: Email pattern to use
@@ -168,24 +176,49 @@ class EmailVerifier:
         Returns:
             Generated email address
         """
+        # Validate inputs
+        if not first_name or not last_name:
+            raise ValueError("First name and last name cannot be empty")
+
         domain = self._extract_domain(company_url)
 
-        # Define a dictionary to map pattern placeholders to corresponding values
-        placeholders = {
-            '{first}': first_name.lower(),
-            '{last}': last_name.lower(),
-            '{f}': first_name[0].lower() if first_name else '',
-            '{l}': last_name[0].lower() if last_name else '',
-            '{first}.{last}': f"{first_name.lower()}.{last_name.lower()}",
-            '{first}_{last}': f"{first_name.lower()}_{last_name.lower()}"
-        }
+        if not domain:
+            raise ValueError(f"Could not extract domain from URL: {company_url}")
 
-        # Replace placeholders in the pattern with actual values
-        email = pattern
-        for placeholder, value in placeholders.items():
-            email = email.replace(placeholder, value)
+        # Clean and normalize names
+        first_name = first_name.strip().lower()
+        middle_name = middle_name.strip().lower() if middle_name else ""
+        last_name = last_name.strip().lower()
 
-        return f"{email}@{domain}"
+        # Generate email based on pattern
+        if pattern == "{first}":
+            email_prefix = first_name
+        elif pattern == "{last}":
+            email_prefix = last_name
+        elif pattern == "{first}.{last}":
+            email_prefix = f"{first_name}.{last_name}"
+        elif pattern == "{first}{last}":
+            email_prefix = f"{first_name}{last_name}"
+        elif pattern == "{first}{middle}{last}":
+            email_prefix = f"{first_name}{middle_name}{last_name}"
+        elif pattern == "{f}{last}":
+            email_prefix = f"{first_name[0]}{last_name}"
+        elif pattern == "{first}{l}":
+            email_prefix = f"{first_name}{last_name[0]}"
+        elif pattern == "{f}{l}":
+            email_prefix = f"{first_name[0]}{last_name[0]}"
+        elif pattern == "{l}{f}":
+            email_prefix = f"{last_name[0]}{first_name[0]}"
+        elif pattern == "{first}.{l}":
+            email_prefix = f"{first_name}.{last_name[0]}"
+        elif pattern == "{f}.{last}":
+            email_prefix = f"{first_name[0]}.{last_name}"
+        elif pattern == "{first}_{last}":
+            email_prefix = f"{first_name}_{last_name}"
+        else:
+            raise ValueError(f"Unknown pattern: {pattern}")
+
+        return f"{email_prefix}@{domain}"
 
     def verify_email(self, email: str) -> Dict[str, Any]:
         """
@@ -198,14 +231,36 @@ class EmailVerifier:
             Dictionary containing verification results
         """
         if not self.validate_emails:
-            return {"valid": True, "status": "not_verified", "deliverable": None, "result": None}
+            return {
+                "valid": True,
+                "status": "not_verified",
+                "deliverable": None,
+                "result": "validation_disabled",
+                "full_response": None
+            }
+
+        if not email or '@' not in email:
+            return {
+                "valid": False,
+                "status": "error",
+                "deliverable": False,
+                "result": "invalid_email_format",
+                "full_response": None
+            }
 
         try:
             self.logger.info(f"Verifying email: {email}")
 
-            # Use Verimail.io API for verification
+            # Use Verimail.io API for verification - FIXED URL FORMAT
             conn = http.client.HTTPSConnection("api.verimail.io")
-            url = f'/v3/verify?email={email}&key={self.api_key}'
+
+            # Build query parameters correctly
+            params = {
+                'email': email,
+                'key': self.api_key
+            }
+            query_string = urlencode(params)
+            url = f'/v3/verify?{query_string}'
 
             # Add a random delay to avoid rate limiting
             time.sleep(random.uniform(0.5, 2))
@@ -213,21 +268,64 @@ class EmailVerifier:
             conn.request("GET", url)
             res = conn.getresponse()
             datajs = res.read()
+            conn.close()  # Properly close connection
+
+            # Check HTTP status code first
+            if res.status != 200:
+                self.logger.error(f"HTTP {res.status} error for email {email}")
+                return {
+                    "valid": False,
+                    "status": "error",
+                    "deliverable": False,
+                    "result": f"http_error_{res.status}",
+                    "full_response": None
+                }
 
             # Parse the response
             data = json.loads(datajs.decode("utf-8"))
 
-            self.logger.info(f"Verification result for {email}: {data['result']}")
+            self.logger.info(f"Verification result for {email}: {data.get('result', 'unknown')}")
+
+            # Check if API request was successful
+            if data.get('status') != 'success':
+                self.logger.error(f"API error for {email}: {data}")
+                return {
+                    "valid": False,
+                    "status": "error",
+                    "deliverable": False,
+                    "result": f"api_error: {data.get('status', 'unknown')}",
+                    "full_response": data
+                }
+
+            # Determine if email is valid based on API response
+            result = data.get('result', '').lower()
+            deliverable = data.get('deliverable', False)
+
+            # deliverable, inbox_full, hardbounce, softbounce, catch_all, disposable, undeliverable
+            is_valid = (
+                result == 'deliverable' or
+                (deliverable and result in ['catch_all', 'inbox_full'])
+            )
 
             # Return complete verification data
             return {
-                "valid": data.get('status') == 'success' and data.get('deliverable', False),
+                "valid": is_valid,
                 "status": data.get('status'),
                 "deliverable": data.get('deliverable'),
                 "result": data.get('result'),
+                "did_you_mean": data.get('did_you_mean', ''),
                 "full_response": data
             }
 
+        except json.JSONDecodeError as e:
+            self.logger.error(f"JSON decode error for email {email}: {str(e)}")
+            return {
+                "valid": False,
+                "status": "error",
+                "deliverable": None,
+                "result": f"json_error: {str(e)}",
+                "full_response": None
+            }
         except Exception as e:
             self.logger.error(f"Error verifying email {email}: {str(e)}")
             # Fallback to basic validation on error
@@ -235,7 +333,7 @@ class EmailVerifier:
                 "valid": self._manual_validation(email),
                 "status": "error",
                 "deliverable": None,
-                "result": f"Error: {str(e)}",
+                "result": f"api_error: {str(e)}",
                 "full_response": None
             }
 
@@ -251,8 +349,10 @@ class EmailVerifier:
         """
         # Check if email contains "@" and at least one "." after "@"
         if "@" in email:
-            domain = email.split("@")[1]
-            return "." in domain
+            parts = email.split("@")
+            if len(parts) == 2:
+                domain = parts[1]
+                return "." in domain and len(domain) > 2
         return False
 
     def extract_phone_number(self, company_url: str) -> Optional[str]:
@@ -308,16 +408,39 @@ class EmailVerifier:
             soup = BeautifulSoup(response.text, "html.parser")
 
             # Search for phone numbers using a more comprehensive regex pattern
-            for tag in soup.find_all(["a", "p", "span", "div"], string=True):
-                # regex pattern for international phone numbers
-                pattern = r'^(?:\+\d{1,3}|0\d{1,3}|00\d{1,2})?(?:\s?\(\d+\))?(?:[-\/\s.]|\d)+$'
-                matches = re.findall(pattern, tag.get_text())
+            phone_pattern = r'(\+?1?[-.\s]?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}|\+?[1-9]\d{1,14})'
 
-                for match in matches:
-                    # Validate the phone number (must be at least 7 digits)
-                    digits = re.sub(r'\D', '', match)
-                    if len(digits) >= 7:
-                        return match.strip()
+            # Search in common phone number containers
+            phone_selectors = [
+                'a[href^="tel:"]',
+                '*[class*="phone"]',
+                '*[class*="contact"]',
+                '*[id*="phone"]',
+                '*[id*="contact"]'
+            ]
+
+            for selector in phone_selectors:
+                elements = soup.select(selector)
+                for element in elements:
+                    text = element.get_text(strip=True)
+                    if 'href' in element.attrs and element.attrs['href'].startswith('tel:'):
+                        # Extract from tel: link
+                        phone = element.attrs['href'].replace('tel:', '').strip()
+                        if self._is_valid_phone(phone):
+                            return phone
+
+                    # Extract from text content
+                    matches = re.findall(phone_pattern, text)
+                    for match in matches:
+                        if self._is_valid_phone(match):
+                            return match.strip()
+
+            # Fallback: search entire page text
+            page_text = soup.get_text()
+            matches = re.findall(phone_pattern, page_text)
+            for match in matches:
+                if self._is_valid_phone(match):
+                    return match.strip()
 
             # No valid phone number found
             return None
@@ -326,56 +449,113 @@ class EmailVerifier:
             self.logger.error(f"Error extracting phone number for {company_url}: {str(e)}")
             return None
 
-    def _try_alternative_patterns(self, first_name: str, last_name: str, company_url: str, 
+    def _is_valid_phone(self, phone: str) -> bool:
+        """
+        Validate if a phone number is reasonable.
+
+        Args:
+            phone: Phone number string to validate
+
+        Returns:
+            Boolean indicating if phone number is valid
+        """
+        # Remove all non-digit characters
+        digits = re.sub(r'\D', '', phone)
+
+        # Must have at least 7 digits and at most 15 (international standard)
+        if len(digits) < 7 or len(digits) > 15:
+            return False
+
+        # Avoid obviously invalid patterns
+        invalid_patterns = ['0000000', '1111111', '1234567', '7777777']
+        return digits not in invalid_patterns
+
+    def _should_try_alternative_patterns(self, verification_result: Dict[str, Any]) -> bool:
+        """
+        Determine if alternative patterns should be tried based on verification result.
+
+        Args:
+            verification_result: Result from email verification
+
+        Returns:
+            Boolean indicating if alternative patterns should be tried
+        """
+        # Get the result and handle None values properly
+        result = verification_result.get('result')
+        if result is None:
+            return False
+
+        # Convert to lowercase for comparison
+        result = result.lower()
+
+        # Try alternatives for hard bounces and undeliverable emails
+        # Based on Verimail API docs: deliverable, inbox_full, hardbounce, softbounce, catch_all, disposable, undeliverable
+        failure_indicators = [
+            'hardbounce',
+            'undeliverable'
+        ]
+
+        return result in failure_indicators
+
+    def _try_alternative_patterns(self, first_name: str, middle_name: str, last_name: str, company_url: str,
                                 current_pattern: str) -> Dict[str, Any]:
         """
-        Try alternative email patterns if current pattern results in hardbounce.
-        
+        Try alternative email patterns if current pattern results in failure.
+
         Args:
             first_name: First name of the person
+            middle_name: Middle name of the person
             last_name: Last name of the person
             company_url: URL of the company
             current_pattern: Current pattern that failed
-            
+
         Returns:
             Dictionary with verification results and pattern attempts info
         """
         # Skip current pattern as it was already tried
         alternative_patterns = [p for p in self.standard_patterns if p != current_pattern]
-        
+
         # Track patterns attempted
         attempted_patterns = [current_pattern]
         attempts_count = 1
-        
+
         self.logger.info(f"Trying alternative patterns for {first_name} {last_name} at {company_url}")
-        
+
         # Try each alternative pattern
         for pattern in alternative_patterns:
-            email = self.generate_emails(first_name, last_name, company_url, pattern)
-            verification_result = self.verify_email(email)
-            attempted_patterns.append(pattern)
-            attempts_count += 1
-            
-            # If we found a valid email, return it
-            if verification_result.get('valid', False) or \
-               verification_result.get('result') != 'hardbounce':
-                return {
-                    "email": email,
-                    "verification": verification_result,
-                    "pattern_used": pattern,
-                    "patterns_attempted": attempted_patterns,
-                    "attempts_count": attempts_count,
-                    "success": True
-                }
-                
-            # Add delay between attempts to avoid rate limiting
-            time.sleep(random.uniform(1, 2))
-        
+            try:
+                email = self.generate_emails(first_name, middle_name, last_name, company_url, pattern)
+                verification_result = self.verify_email(email)
+                attempted_patterns.append(pattern)
+                attempts_count += 1
+
+                # Log the attempt
+                self.logger.info(f"Pattern {pattern} -> {email} -> {verification_result.get('result', 'unknown')}")
+
+                # If we found a valid email or one that's not a hard failure, return it
+                if verification_result.get('valid', False) or \
+                   not self._should_try_alternative_patterns(verification_result):
+                    return {
+                        "email": email,
+                        "verification": verification_result,
+                        "pattern_used": pattern,
+                        "patterns_attempted": attempted_patterns,
+                        "attempts_count": attempts_count,
+                        "success": True
+                    }
+
+                # Add delay between attempts to avoid rate limiting
+                time.sleep(random.uniform(1, 2))
+
+            except Exception as e:
+                self.logger.error(f"Error trying pattern {pattern}: {str(e)}")
+                continue
+
         # If we get here, all patterns failed
         self.logger.warning(f"All email patterns failed for {first_name} {last_name} at {company_url}")
         return {
             "email": None,
-            "verification": None, 
+            "verification": None,
             "pattern_used": None,
             "patterns_attempted": attempted_patterns,
             "attempts_count": attempts_count,
@@ -395,69 +575,103 @@ class EmailVerifier:
         """
         result = row.to_dict()
 
-        # Parse full name
-        name = HumanName(row['Full Name'])
-        result['First Name'] = name.first
-        result['Last Name'] = name.last
+        try:
+            # Parse full name
+            name = HumanName(row['Full Name'])
+            result['First Name'] = name.first
+            result['Middle Name'] = name.middle if name.middle else ""  # Handle None middle name
+            result['Last Name'] = name.last
 
-        # Generate email
-        result['Email'] = self.generate_emails(
-            name.first,
-            name.last,
-            row['Company URL'],
-            row['Pattern']
-        )
+            # Validate that we have both first and last names
+            if not result['First Name'] or not result['Last Name']:
+                self.logger.warning(f"Missing name components for: {row['Full Name']}")
+                result['Email'] = None
+                result['Email Verification'] = False
+                result['Verification Status'] = "error"
+                result['Deliverable'] = False
+                result['Verification Result'] = "Missing name components"
+                result['Patterns Attempted'] = None
+                result['Patterns Count'] = 0
+                result['Phone Number'] = None
+                return (index, result)
 
-        # Check if this name is in exception list
-        if self.validate_emails and row['Full Name'] in self.exception_names:
-            self.logger.info(f"Skipping verification for exception name: {row['Full Name']}")
-            result['Email Verification'] = None
-            result['Verification Status'] = "skipped"
-            result['Deliverable'] = None
-            result['Verification Result'] = "Exception name"
-            result['Patterns Attempted'] = None
-            result['Patterns Count'] = None
-        # Verify email
-        elif self.validate_emails:
-            verification_result = self.verify_email(result['Email'])
-            
-            # If verification failed with hardbounce, try alternative patterns
-            if verification_result.get('result') == 'hardbounce':
-                self.logger.info(f"Hardbounce detected for {result['Email']}, trying alternative patterns")
-                
-                retry_result = self._try_alternative_patterns(
-                    name.first, 
-                    name.last, 
-                    row['Company URL'], 
-                    row['Pattern']
-                )
-                
-                if retry_result['success']:
-                    # Update with successful pattern
-                    result['Email'] = retry_result['email']
-                    verification_result = retry_result['verification']
-                    result['Pattern'] = retry_result['pattern_used']
-                
-                # Add retry information
-                result['Patterns Attempted'] = ', '.join(retry_result['patterns_attempted'])
-                result['Patterns Count'] = retry_result['attempts_count']
-            else:
-                # No retry needed
+            # Generate initial email
+            initial_email = self.generate_emails(
+                result['First Name'],
+                result['Middle Name'],  # Pass middle name (now guaranteed to be string)
+                result['Last Name'],
+                row['Company URL'],
+                row['Pattern']
+            )
+            result['Email'] = initial_email
+
+            # Check if this name is in exception list
+            if self.validate_emails and row['Full Name'] in self.exception_names:
+                self.logger.info(f"Skipping verification for exception name: {row['Full Name']}")
+                result['Email Verification'] = None
+                result['Verification Status'] = "skipped"
+                result['Deliverable'] = None
+                result['Verification Result'] = "Exception name"
                 result['Patterns Attempted'] = row['Pattern']
                 result['Patterns Count'] = 1
-            
-            # Store verification results
-            result['Email Verification'] = verification_result['valid']
-            result['Verification Status'] = verification_result['status']
-            result['Deliverable'] = verification_result['deliverable']
-            result['Verification Result'] = verification_result['result']
-        else:
-            # If not validating emails
-            result['Patterns Attempted'] = row['Pattern']
-            result['Patterns Count'] = 1
+            # Verify email
+            elif self.validate_emails:
+                verification_result = self.verify_email(initial_email)
 
-        # Extract phone number
-        result['Phone Number'] = self.extract_phone_number(row['Company URL'])
+                # Check if we should try alternative patterns
+                if self._should_try_alternative_patterns(verification_result):
+                    self.logger.info(f"Primary pattern failed for {initial_email}, trying alternatives")
+
+                    retry_result = self._try_alternative_patterns(
+                        result['First Name'],
+                        result['Middle Name'],  # Pass middle name
+                        result['Last Name'],
+                        row['Company URL'],
+                        row['Pattern']
+                    )
+
+                    if retry_result['success']:
+                        # Update with successful pattern
+                        result['Email'] = retry_result['email']
+                        verification_result = retry_result['verification']
+                        result['Pattern'] = retry_result['pattern_used']
+
+                    # Add retry information
+                    result['Patterns Attempted'] = ', '.join(retry_result['patterns_attempted'])
+                    result['Patterns Count'] = retry_result['attempts_count']
+                else:
+                    # No retry needed
+                    result['Patterns Attempted'] = row['Pattern']
+                    result['Patterns Count'] = 1
+
+                # Store verification results
+                result['Email Verification'] = verification_result.get('valid', False)
+                result['Verification Status'] = verification_result.get('status', 'unknown')
+                result['Deliverable'] = verification_result.get('deliverable')
+                result['Verification Result'] = verification_result.get('result', 'unknown')
+                result['Did You Mean'] = verification_result.get('did_you_mean', '')
+            else:
+                # If not validating emails
+                result['Email Verification'] = None
+                result['Verification Status'] = "not_verified"
+                result['Deliverable'] = None
+                result['Verification Result'] = "Validation disabled"
+                result['Patterns Attempted'] = row['Pattern']
+                result['Patterns Count'] = 1
+
+            # Extract phone number
+            result['Phone Number'] = self.extract_phone_number(row['Company URL'])
+
+        except Exception as e:
+            self.logger.error(f"Error processing row {index}: {str(e)}")
+            result['Email'] = None
+            result['Email Verification'] = False
+            result['Verification Status'] = "error"
+            result['Deliverable'] = False
+            result['Verification Result'] = f"Processing error: {str(e)}"
+            result['Patterns Attempted'] = None
+            result['Patterns Count'] = 0
+            result['Phone Number'] = None
 
         return (index, result)
 
@@ -483,9 +697,15 @@ class EmailVerifier:
                 self.logger.error(f"Error: {filename} is missing required columns: {missing_columns}")
                 return None
 
+            # Validate data quality
+            df = df.dropna(subset=required_columns)
+            if df.empty:
+                self.logger.error(f"No valid data found in {filename}")
+                return None
+
             # Process each row
             results = []
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=3) as executor:  # Reduced to avoid rate limiting
                 # Submit jobs with their original indices
                 futures = {executor.submit(self._process_row, row, i): i
                           for i, (_, row) in enumerate(df.iterrows())}
@@ -509,8 +729,11 @@ class EmailVerifier:
             processed_df = pd.DataFrame(results)
 
             # Delete input file
-            os.remove(filename)
-            self.logger.info(f"Deleted input file: {filename}")
+            try:
+                os.remove(filename)
+                self.logger.info(f"Deleted input file: {filename}")
+            except Exception as e:
+                self.logger.warning(f"Could not delete input file {filename}: {str(e)}")
 
             # Update progress bar
             progress_bar.update(1)
@@ -560,14 +783,23 @@ class EmailVerifier:
             output_filename = f'Verified_Emails_{timestamp}.xlsx'
             aggregated_df.to_excel(output_filename, index=False)
 
+            # Print summary statistics
+            total_rows = len(aggregated_df)
+            if self.validate_emails:
+                verified_emails = len(aggregated_df[aggregated_df['Email Verification'] == True])
+                self.console.print(f"[green]Summary: {verified_emails}/{total_rows} emails verified successfully")
+            else:
+                self.console.print(f"[green]Summary: {total_rows} emails generated (validation disabled)")
+
             # Download the output file
             self.console.print(f"[green]Downloading output file: {output_filename}")
             files.download(output_filename)
 
             # Download the log file
-            log_file = self.logger.handlers[0].baseFilename
-            self.console.print(f"[green]Downloading log file: {log_file}")
-            files.download(log_file)
+            if self.logger.handlers:
+                log_file = self.logger.handlers[0].baseFilename
+                self.console.print(f"[green]Downloading log file: {log_file}")
+                files.download(log_file)
 
             self.console.print("[green]Batch processing completed successfully.")
 
