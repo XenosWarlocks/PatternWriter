@@ -1,5 +1,5 @@
-# PatternWriter with Fixed Verimail API Integration
-# Public Version 3.4 - Verimail API Bug Fix Applied
+# PatternWriter with Enhanced Security and Error Handling
+# Production Version 4.0 - Enhanced Security, Rate Limiting, and Error Handling
 
 import os
 import re
@@ -17,12 +17,109 @@ from nameparser import HumanName
 from urllib.parse import urlparse, urlencode
 from rich.console import Console
 from rich.progress import Progress, TaskID
-from requests.exceptions import Timeout, RequestException
+from requests.exceptions import Timeout, RequestException, ConnectionError, HTTPError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Optional, Set, Any, Union
+from datetime import datetime, timedelta
+from collections import defaultdict
+import ssl
+import socket
+from urllib.robotparser import RobotFileParser
+
+
+class RateLimiter:
+    """Rate limiter to prevent API abuse and respect service limits."""
+
+    def __init__(self, max_calls: int = 100, time_window: int = 3600):
+        """
+        Initialize rate limiter.
+
+        Args:
+            max_calls: Maximum calls allowed in time window
+            time_window: Time window in seconds (default: 1 hour)
+        """
+        self.max_calls = max_calls
+        self.time_window = time_window
+        self.calls = []
+        self.last_call_time = 0
+
+    def can_make_call(self) -> bool:
+        """Check if a call can be made without exceeding rate limit."""
+        now = time.time()
+
+        # Remove calls outside the time window
+        self.calls = [call_time for call_time in self.calls if now - call_time < self.time_window]
+
+        # Check if we're under the limit
+        return len(self.calls) < self.max_calls
+
+    def wait_if_needed(self) -> None:
+        """Wait if necessary to respect rate limits."""
+        if not self.can_make_call():
+            oldest_call = min(self.calls) if self.calls else time.time()
+            wait_time = self.time_window - (time.time() - oldest_call) + 1
+            if wait_time > 0:
+                logging.info(f"Rate limit reached. Waiting {wait_time:.1f} seconds...")
+                time.sleep(wait_time)
+
+        # Add minimum delay between calls
+        now = time.time()
+        if self.last_call_time > 0:
+            time_since_last = now - self.last_call_time
+            min_interval = 1.0  # Minimum 1 second between calls
+            if time_since_last < min_interval:
+                time.sleep(min_interval - time_since_last)
+
+        self.calls.append(time.time())
+        self.last_call_time = time.time()
+
+
+class SecurityValidator:
+    """Security validator for URLs and inputs."""
+
+    DANGEROUS_DOMAINS = {
+        'localhost', '127.0.0.1', '0.0.0.0', '::1',
+        '10.', '172.16.', '172.17.', '172.18.', '172.19.',
+        '172.20.', '172.21.', '172.22.', '172.23.', '172.24.',
+        '172.25.', '172.26.', '172.27.', '172.28.', '172.29.',
+        '172.30.', '172.31.', '192.168.'
+    }
+
+    @classmethod
+    def is_safe_domain(cls, domain: str) -> bool:
+        """Check if domain is safe to access."""
+        if not domain:
+            return False
+
+        domain = domain.lower().strip()
+
+        # Check for dangerous patterns
+        for dangerous in cls.DANGEROUS_DOMAINS:
+            if domain.startswith(dangerous):
+                return False
+
+        # Basic domain validation
+        if not re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', domain):
+            return False
+
+        return True
+
+    @classmethod
+    def sanitize_input(cls, input_str: str, max_length: int = 255) -> str:
+        """Sanitize user input."""
+        if not input_str:
+            return ""
+
+        # Remove potentially dangerous characters
+        sanitized = re.sub(r'[<>"\'\x00-\x1f\x7f-\x9f]', '', str(input_str))
+
+        # Limit length
+        return sanitized[:max_length].strip()
+
 
 class EmailVerifier:
-    """A class to verify and generate email addresses based on patterns."""
+    """A secure, production-ready email verification and generation system."""
+
     def __init__(self, log_file: str = "email_validation.log", api_key: str = None):
         """
         Initialize the EmailVerifier class.
@@ -31,15 +128,27 @@ class EmailVerifier:
             log_file: Path to the log file
             api_key: Verimail.io API key
         """
-        # Set up logging
-        self.logger = self._setup_logging(log_file)
-        self.visited_urls: Set[str] = set()  # Set to store visited URLs
+        # Initialize core components first
+        self.visited_urls: Set[str] = set()
         self.console = Console()
-        # Ask if user wants to validate emails
+        self.security_validator = SecurityValidator()  # Initialize this FIRST
+
+        # Initialize rate limiters
+        self.api_rate_limiter = RateLimiter(max_calls=100, time_window=3600)  # 100 calls per hour
+        self.web_rate_limiter = RateLimiter(max_calls=50, time_window=300)    # 50 calls per 5 minutes
+
+        # Set up logging with proper configuration (now security_validator exists)
+        self.logger = self._setup_logging(log_file)
+
+        # Request session with proper configuration
+        self.session = self._create_session()
+
+        # Configuration
         self.validate_emails = self._ask_for_email_validation()
-        # Get API key if validation is requested
         self.api_key = self._get_api_key() if self.validate_emails else None
-        # Standard email patterns
+        self.exception_names = self._get_exception_names() if self.validate_emails else []
+
+        # Email patterns
         self.standard_patterns = [
             "{first}",
             "{last}",
@@ -51,185 +160,309 @@ class EmailVerifier:
             "{first}_{last}",
             "{first}{middle}{last}"
         ]
-        # Get exception names for verification skipping
-        self.exception_names = self._get_exception_names() if self.validate_emails else []
+
+        # Statistics tracking
+        self.stats = {
+            'emails_generated': 0,
+            'emails_verified': 0,
+            'api_calls_made': 0,
+            'errors_encountered': 0,
+            'phone_numbers_found': 0
+        }
 
     def _setup_logging(self, log_file: str) -> logging.Logger:
-        """
-        Set up logging configuration.
+        """Set up secure logging configuration."""
+        # Validate log file path (now security_validator exists)
+        log_file = self.security_validator.sanitize_input(log_file, 100)
+        if not log_file.endswith('.log'):
+            log_file += '.log'
 
-        Args:
-            log_file: Path to the log file
-
-        Returns:
-            Configured logger instance
-        """
         logger = logging.getLogger("EmailVerifier")
         logger.setLevel(logging.INFO)
-
-        # Clear existing handlers to avoid duplicates
         logger.handlers.clear()
 
-        # Create file handler
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.INFO)
+        try:
+            # Create file handler with proper permissions
+            file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+            file_handler.setLevel(logging.INFO)
 
-        # Create formatter and add it to the handler
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
+            # Create secure formatter
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
 
-        # Add handler to logger
-        logger.addHandler(file_handler)
+            # Also add console handler for important messages
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.WARNING)
+            console_handler.setFormatter(formatter)
+            logger.addHandler(console_handler)
+
+        except Exception as e:
+            print(f"Error setting up logging: {e}")
+            # Fallback to console only
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            logger.addHandler(console_handler)
 
         return logger
 
+    def _create_session(self) -> requests.Session:
+        """Create a properly configured requests session."""
+        session = requests.Session()
+
+        # Set reasonable timeouts
+        session.timeout = (10, 30)  # (connect, read) timeout
+
+        # Set up retry strategy
+        from urllib3.util.retry import Retry
+        from requests.adapters import HTTPAdapter
+
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        # Set security headers
+        session.headers.update({
+            'User-Agent': 'EmailVerifier/4.0 (Professional Email Verification Tool)',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        })
+
+        return session
+
     def _ask_for_email_validation(self) -> bool:
-        """
-        Ask user if they want to validate emails.
+        """Ask user if they want to validate emails with enhanced input validation."""
+        max_attempts = 3
+        attempts = 0
 
-        Returns:
-            Boolean indicating whether to validate emails
-        """
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Please answer the following question:", total=1)
-            while True:
-                response = input("Would you like to validate email addresses using Verimail API? (yes/no): ").lower()
-                if response in ['yes', 'no']:
-                    progress.update(task, advance=1, description="[green]Question answered", total=1)
-                    return response == 'yes'
+        while attempts < max_attempts:
+            try:
+                response = input("Would you like to validate email addresses using Verimail API? (yes/no): ").lower().strip()
+                response = self.security_validator.sanitize_input(response, 10)
+
+                if response in ['yes', 'y', '1', 'true']:
+                    return True
+                elif response in ['no', 'n', '0', 'false']:
+                    return False
                 else:
-                    self.console.print("[red]Invalid response. Please enter 'yes' or 'no'.")
+                    attempts += 1
+                    if attempts < max_attempts:
+                        self.console.print(f"[yellow]Invalid response. Please enter 'yes' or 'no'. ({max_attempts - attempts} attempts remaining)")
+                    else:
+                        self.console.print("[yellow]Maximum attempts reached. Defaulting to 'no'.")
+                        return False
+            except (EOFError, KeyboardInterrupt):
+                self.console.print("[yellow]Input cancelled. Defaulting to 'no'.")
+                return False
+            except Exception as e:
+                self.logger.error(f"Error getting user input: {e}")
+                return False
 
-    def _get_api_key(self) -> str:
-        """
-        Get Verimail API key from user.
+        return False
 
-        Returns:
-            API key string
-        """
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Please provide your Verimail.io API key:", total=1)
-            api_key = input("Enter your Verimail.io API key: ")
-            progress.update(task, advance=1, description="[green]API key received", total=1)
-            return api_key
+    def _get_api_key(self) -> Optional[str]:
+        """Get and validate Verimail API key."""
+        max_attempts = 3
+        attempts = 0
+
+        while attempts < max_attempts:
+            try:
+                api_key = input("Enter your Verimail.io API key: ").strip()
+                api_key = self.security_validator.sanitize_input(api_key, 100)
+
+                if not api_key:
+                    attempts += 1
+                    if attempts < max_attempts:
+                        self.console.print(f"[yellow]API key cannot be empty. ({max_attempts - attempts} attempts remaining)")
+                    continue
+
+                # Basic API key validation
+                if len(api_key) < 10 or not re.match(r'^[a-zA-Z0-9_-]+$', api_key):
+                    attempts += 1
+                    if attempts < max_attempts:
+                        self.console.print(f"[yellow]Invalid API key format. ({max_attempts - attempts} attempts remaining)")
+                    continue
+
+                return api_key
+
+            except (EOFError, KeyboardInterrupt):
+                self.console.print("[yellow]Input cancelled.")
+                return None
+            except Exception as e:
+                self.logger.error(f"Error getting API key: {e}")
+                return None
+
+        self.console.print("[red]Failed to get valid API key.")
+        return None
 
     def _get_exception_names(self) -> List[str]:
-        """
-        Get list of names to skip verification for.
+        """Get list of names to skip verification for with validation."""
+        try:
+            response = input("Would you like to add exception names to skip verification? (yes/no): ").lower().strip()
+            response = self.security_validator.sanitize_input(response, 10)
 
-        Returns:
-            List of full names to skip verification
-        """
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Would you like to add exception names to skip verification?", total=1)
-            response = input("Would you like to add exception names to skip verification? (yes/no): ").lower()
-
-            if response == 'yes':
-                exceptions = []
-                self.console.print("[cyan]Enter full names (one per line). Enter a blank line when finished:")
-                while True:
-                    name = input()
-                    if not name:
-                        break
-                    exceptions.append(name.strip())
-                progress.update(task, advance=1, description=f"[green]Added {len(exceptions)} exception names", total=1)
-                return exceptions
-            else:
-                progress.update(task, advance=1, description="[green]No exceptions added", total=1)
+            if response not in ['yes', 'y', '1', 'true']:
                 return []
 
-    def _extract_domain(self, company_url: str) -> str:
-        """
-        Extract domain from a company URL.
+            exceptions = []
+            self.console.print("[cyan]Enter full names (one per line). Enter a blank line when finished:")
 
-        Args:
-            company_url: URL of the company
+            while len(exceptions) < 100:  # Limit to prevent abuse
+                try:
+                    name = input().strip()
+                    if not name:
+                        break
 
-        Returns:
-            Extracted domain name
-        """
-        # Adding protocol if missing
-        if not company_url.startswith('https://') and not company_url.startswith('http://'):
-            company_url = 'https://' + company_url
+                    # Validate and sanitize name
+                    name = self.security_validator.sanitize_input(name, 100)
+                    if name and len(name) >= 2:
+                        exceptions.append(name)
+                    else:
+                        self.console.print("[yellow]Name too short or invalid. Skipping.")
 
-        # Extract domain names from company URL
-        domain = urlparse(company_url).netloc
+                except (EOFError, KeyboardInterrupt):
+                    break
 
-        # Remove common subdomains
-        remove_subdomains = ["www.", "developer.", "aws.", "ai."]
-        for sub in remove_subdomains:
-            domain = domain.replace(sub, '')
+            self.console.print(f"[green]Added {len(exceptions)} exception names")
+            return exceptions
 
-        return domain
+        except Exception as e:
+            self.logger.error(f"Error getting exception names: {e}")
+            return []
 
-    def generate_emails(self, first_name: str, middle_name: str, last_name: str, company_url: str, pattern: str) -> str:
-        """
-        Generate email addresses based on pattern.
+    def _extract_domain(self, company_url: str) -> Optional[str]:
+        """Extract and validate domain from company URL."""
+        try:
+            # Sanitize input
+            company_url = self.security_validator.sanitize_input(company_url, 500)
+            if not company_url:
+                return None
 
-        Args:
-            first_name: First name of the person
-            middle_name: Middle name of the person
-            last_name: Last name of the person
-            company_url: URL of the company
-            pattern: Email pattern to use
+            # Add protocol if missing
+            if not company_url.startswith(('https://', 'http://')):
+                company_url = 'https://' + company_url
 
-        Returns:
-            Generated email address
-        """
-        # Validate inputs
-        if not first_name or not last_name:
-            raise ValueError("First name and last name cannot be empty")
+            # Parse URL
+            parsed = urlparse(company_url)
+            domain = parsed.netloc.lower()
 
-        domain = self._extract_domain(company_url)
+            if not domain:
+                return None
 
-        if not domain:
-            raise ValueError(f"Could not extract domain from URL: {company_url}")
+            # Remove common subdomains
+            subdomains_to_remove = ['www.', 'mail.', 'webmail.', 'smtp.', 'pop.', 'imap.']
+            for subdomain in subdomains_to_remove:
+                if domain.startswith(subdomain):
+                    domain = domain[len(subdomain):]
 
-        # Clean and normalize names
-        first_name = first_name.strip().lower()
-        middle_name = middle_name.strip().lower() if middle_name else ""
-        last_name = last_name.strip().lower()
+            # Security check
+            if not self.security_validator.is_safe_domain(domain):
+                self.logger.warning(f"Unsafe domain detected: {domain}")
+                return None
 
-        # Generate email based on pattern
-        if pattern == "{first}":
-            email_prefix = first_name
-        elif pattern == "{last}":
-            email_prefix = last_name
-        elif pattern == "{first}.{last}":
-            email_prefix = f"{first_name}.{last_name}"
-        elif pattern == "{first}{last}":
-            email_prefix = f"{first_name}{last_name}"
-        elif pattern == "{first}{middle}{last}":
-            email_prefix = f"{first_name}{middle_name}{last_name}"
-        elif pattern == "{f}{last}":
-            email_prefix = f"{first_name[0]}{last_name}"
-        elif pattern == "{first}{l}":
-            email_prefix = f"{first_name}{last_name[0]}"
-        elif pattern == "{f}{l}":
-            email_prefix = f"{first_name[0]}{last_name[0]}"
-        elif pattern == "{l}{f}":
-            email_prefix = f"{last_name[0]}{first_name[0]}"
-        elif pattern == "{first}.{l}":
-            email_prefix = f"{first_name}.{last_name[0]}"
-        elif pattern == "{f}.{last}":
-            email_prefix = f"{first_name[0]}.{last_name}"
-        elif pattern == "{first}_{last}":
-            email_prefix = f"{first_name}_{last_name}"
-        else:
-            raise ValueError(f"Unknown pattern: {pattern}")
+            return domain
 
-        return f"{email_prefix}@{domain}"
+        except Exception as e:
+            self.logger.error(f"Error extracting domain from {company_url}: {e}")
+            return None
+
+    def generate_emails(self, first_name: str, middle_name: str, last_name: str,
+                       company_url: str, pattern: str) -> Optional[str]:
+        """Generate email address with enhanced validation."""
+        try:
+            # Validate and sanitize inputs
+            first_name = self.security_validator.sanitize_input(first_name, 50).lower()
+            middle_name = self.security_validator.sanitize_input(middle_name or "", 50).lower()
+            last_name = self.security_validator.sanitize_input(last_name, 50).lower()
+            pattern = self.security_validator.sanitize_input(pattern, 50)
+
+            if not first_name or not last_name:
+                raise ValueError("First name and last name are required")
+
+            # Validate names contain only letters and basic characters
+            if not re.match(r'^[a-zA-Z\s\-\'\.]+$', first_name + last_name):
+                raise ValueError("Names contain invalid characters")
+
+            domain = self._extract_domain(company_url)
+            if not domain:
+                raise ValueError(f"Could not extract valid domain from URL: {company_url}")
+
+            # Generate email prefix based on pattern
+            email_prefix = self._generate_email_prefix(first_name, middle_name, last_name, pattern)
+            if not email_prefix:
+                raise ValueError(f"Could not generate email prefix for pattern: {pattern}")
+
+            email = f"{email_prefix}@{domain}"
+
+            # Validate final email format
+            if not self._is_valid_email_format(email):
+                raise ValueError(f"Generated email has invalid format: {email}")
+
+            self.stats['emails_generated'] += 1
+            return email
+
+        except Exception as e:
+            self.logger.error(f"Error generating email: {e}")
+            self.stats['errors_encountered'] += 1
+            return None
+
+    def _generate_email_prefix(self, first_name: str, middle_name: str,
+                              last_name: str, pattern: str) -> Optional[str]:
+        """Generate email prefix based on pattern."""
+        try:
+            # Clean names - remove spaces and special characters
+            first_clean = re.sub(r'[^a-z]', '', first_name)
+            middle_clean = re.sub(r'[^a-z]', '', middle_name) if middle_name else ""
+            last_clean = re.sub(r'[^a-z]', '', last_name)
+
+            if not first_clean or not last_clean:
+                return None
+
+            patterns = {
+                "{first}": first_clean,
+                "{last}": last_clean,
+                "{first}.{last}": f"{first_clean}.{last_clean}",
+                "{first}{last}": f"{first_clean}{last_clean}",
+                "{first}{middle}{last}": f"{first_clean}{middle_clean}{last_clean}",
+                "{f}{last}": f"{first_clean[0]}{last_clean}",
+                "{first}{l}": f"{first_clean}{last_clean[0]}",
+                "{f}{l}": f"{first_clean[0]}{last_clean[0]}",
+                "{l}{f}": f"{last_clean[0]}{first_clean[0]}",
+                "{first}.{l}": f"{first_clean}.{last_clean[0]}",
+                "{f}.{last}": f"{first_clean[0]}.{last_clean}",
+                "{first}_{last}": f"{first_clean}_{last_clean}"
+            }
+
+            return patterns.get(pattern)
+
+        except Exception as e:
+            self.logger.error(f"Error generating email prefix: {e}")
+            return None
+
+    def _is_valid_email_format(self, email: str) -> bool:
+        """Validate email format."""
+        if not email or len(email) > 320:  # RFC 5321 limit
+            return False
+
+        # Basic email regex
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email) is not None
 
     def verify_email(self, email: str) -> Dict[str, Any]:
-        """
-        Verify if an email address is valid using Verimail.io API.
-
-        Args:
-            email: Email address to verify
-
-        Returns:
-            Dictionary containing verification results
-        """
+        """Verify email with enhanced error handling and security."""
         if not self.validate_emails:
             return {
                 "valid": True,
@@ -239,7 +472,7 @@ class EmailVerifier:
                 "full_response": None
             }
 
-        if not email or '@' not in email:
+        if not self._is_valid_email_format(email):
             return {
                 "valid": False,
                 "status": "error",
@@ -248,291 +481,331 @@ class EmailVerifier:
                 "full_response": None
             }
 
+        # Check rate limit
+        self.api_rate_limiter.wait_if_needed()
+
         try:
             self.logger.info(f"Verifying email: {email}")
+            self.stats['api_calls_made'] += 1
 
-            # Use Verimail.io API for verification - FIXED URL FORMAT
-            conn = http.client.HTTPSConnection("api.verimail.io")
+            # Create secure HTTPS connection
+            conn = http.client.HTTPSConnection(
+                "api.verimail.io",
+                timeout=30,
+                context=ssl.create_default_context()
+            )
 
-            # Build query parameters correctly
+            # Build secure query parameters
             params = {
-                'email': email,
+                'email': email[:320],  # Limit email length
                 'key': self.api_key
             }
-            query_string = urlencode(params)
+
+            query_string = urlencode(params, safe='@')
             url = f'/v3/verify?{query_string}'
 
-            # Add a random delay to avoid rate limiting
-            time.sleep(random.uniform(0.5, 2))
+            # Make request with security headers
+            headers = {
+                'User-Agent': 'EmailVerifier/4.0',
+                'Accept': 'application/json',
+                'Connection': 'close'
+            }
 
-            conn.request("GET", url)
-            res = conn.getresponse()
-            datajs = res.read()
-            conn.close()  # Properly close connection
+            conn.request("GET", url, headers=headers)
+            response = conn.getresponse()
+            data = response.read()
+            conn.close()
 
-            # Check HTTP status code first
-            if res.status != 200:
-                self.logger.error(f"HTTP {res.status} error for email {email}")
+            # Validate response
+            if response.status != 200:
+                self.logger.error(f"HTTP {response.status} error for email {email}")
                 return {
                     "valid": False,
                     "status": "error",
                     "deliverable": False,
-                    "result": f"http_error_{res.status}",
+                    "result": f"http_error_{response.status}",
                     "full_response": None
                 }
 
-            # Parse the response
-            data = json.loads(datajs.decode("utf-8"))
-
-            self.logger.info(f"Verification result for {email}: {data.get('result', 'unknown')}")
-
-            # Check if API request was successful
-            if data.get('status') != 'success':
-                self.logger.error(f"API error for {email}: {data}")
+            # Parse JSON response
+            try:
+                json_data = json.loads(data.decode("utf-8"))
+            except json.JSONDecodeError as e:
+                self.logger.error(f"JSON decode error: {e}")
                 return {
                     "valid": False,
                     "status": "error",
                     "deliverable": False,
-                    "result": f"api_error: {data.get('status', 'unknown')}",
-                    "full_response": data
+                    "result": "json_decode_error",
+                    "full_response": None
                 }
 
-            # Determine if email is valid based on API response
-            result = data.get('result', '').lower()
-            deliverable = data.get('deliverable', False)
+            # Validate API response structure
+            if not isinstance(json_data, dict):
+                return {
+                    "valid": False,
+                    "status": "error",
+                    "deliverable": False,
+                    "result": "invalid_api_response",
+                    "full_response": None
+                }
 
-            # deliverable, inbox_full, hardbounce, softbounce, catch_all, disposable, undeliverable
+            # Process results
+            status = json_data.get('status', '').lower()
+            result = json_data.get('result', '').lower()
+            deliverable = json_data.get('deliverable', False)
+
+            if status != 'success':
+                self.logger.error(f"API error for {email}: {status}")
+                return {
+                    "valid": False,
+                    "status": "error",
+                    "deliverable": False,
+                    "result": f"api_error_{status}",
+                    "full_response": json_data
+                }
+
+            # Determine validity
             is_valid = (
                 result == 'deliverable' or
                 (deliverable and result in ['catch_all', 'inbox_full'])
             )
 
-            # Return complete verification data
+            if is_valid:
+                self.stats['emails_verified'] += 1
+
             return {
                 "valid": is_valid,
-                "status": data.get('status'),
-                "deliverable": data.get('deliverable'),
-                "result": data.get('result'),
-                "did_you_mean": data.get('did_you_mean', ''),
-                "full_response": data
+                "status": json_data.get('status'),
+                "deliverable": json_data.get('deliverable'),
+                "result": json_data.get('result'),
+                "did_you_mean": json_data.get('did_you_mean', ''),
+                "full_response": json_data
             }
 
-        except json.JSONDecodeError as e:
-            self.logger.error(f"JSON decode error for email {email}: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Error verifying email {email}: {e}")
+            self.stats['errors_encountered'] += 1
             return {
                 "valid": False,
                 "status": "error",
                 "deliverable": None,
-                "result": f"json_error: {str(e)}",
+                "result": f"verification_error: {str(e)[:100]}",
                 "full_response": None
             }
-        except Exception as e:
-            self.logger.error(f"Error verifying email {email}: {str(e)}")
-            # Fallback to basic validation on error
-            return {
-                "valid": self._manual_validation(email),
-                "status": "error",
-                "deliverable": None,
-                "result": f"api_error: {str(e)}",
-                "full_response": None
-            }
-
-    def _manual_validation(self, email: str) -> bool:
-        """
-        Perform basic manual validation of an email.
-
-        Args:
-            email: Email address to validate
-
-        Returns:
-            Boolean indicating whether the email is valid
-        """
-        # Check if email contains "@" and at least one "." after "@"
-        if "@" in email:
-            parts = email.split("@")
-            if len(parts) == 2:
-                domain = parts[1]
-                return "." in domain and len(domain) > 2
-        return False
 
     def extract_phone_number(self, company_url: str) -> Optional[str]:
-        """
-        Extract phone number from a company website.
-
-        Args:
-            company_url: URL of the company website
-
-        Returns:
-            Extracted phone number or None
-        """
-        # Check if the URL has already been visited
-        if company_url in self.visited_urls:
+        """Extract phone number with enhanced security and error handling."""
+        # Sanitize and validate URL
+        company_url = self.security_validator.sanitize_input(company_url, 500)
+        if not company_url or company_url in self.visited_urls:
             return None
 
-        # Add the URL to the set of visited URLs
+        # Check rate limit
+        self.web_rate_limiter.wait_if_needed()
+
+        # Add to visited URLs
         self.visited_urls.add(company_url)
 
         try:
-            # Check and add missing protocol
-            if not company_url.startswith('https://') and not company_url.startswith('http://'):
+            # Validate domain
+            domain = self._extract_domain(company_url)
+            if not domain or not self.security_validator.is_safe_domain(domain):
+                self.logger.warning(f"Skipping unsafe domain: {domain}")
+                return None
+
+            # Add protocol if missing
+            if not company_url.startswith(('https://', 'http://')):
                 company_url = 'https://' + company_url
 
-            # Set up a list of user agents
-            user_agents = [
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:86.0) Gecko/20100101 Firefox/86.0',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36',
-                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15',
-                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.82 Safari/537.36'
-            ]
-
-            # Select a random user agent
-            headers = {'User-Agent': random.choice(user_agents)}
-
-            # Introduce a random delay between requests
-            time.sleep(random.uniform(1, 3))
-
-            # Visit the website with a timeout
+            # Check robots.txt compliance (basic check)
             try:
-                response = requests.get(company_url, timeout=10, headers=headers)
-                response.raise_for_status()  # Raise an exception for bad status codes
-                self.logger.info(f"Successfully fetched website: {company_url}")
-            except Timeout:
-                self.logger.warning(f"Timeout occurred while fetching {company_url}")
-                return None
-            except RequestException as e:
-                self.logger.error(f"Error fetching {company_url}: {str(e)}")
+                rp = RobotFileParser()
+                rp.set_url(f"{company_url}/robots.txt")
+                rp.read()
+                if not rp.can_fetch('*', company_url):
+                    self.logger.info(f"Robots.txt disallows crawling: {company_url}")
+                    return None
+            except:
+                pass  # Continue if robots.txt check fails
+
+            # Make request with security measures
+            headers = {
+                'User-Agent': random.choice([
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                ]),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate'
+            }
+
+            response = self.session.get(
+                company_url,
+                headers=headers,
+                timeout=(10, 30),
+                allow_redirects=True,
+                verify=True  # Verify SSL certificates
+            )
+            response.raise_for_status()
+
+            # Limit response size to prevent memory issues
+            if len(response.content) > 5 * 1024 * 1024:  # 5MB limit
+                self.logger.warning(f"Response too large for {company_url}")
                 return None
 
-            # Parse the HTML
+            # Parse with security considerations
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # Search for phone numbers using a more comprehensive regex pattern
-            phone_pattern = r'(\+?1?[-.\s]?\(?[0-9]{3}\)?[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}|\+?[1-9]\d{1,14})'
+            # Remove potentially dangerous elements
+            for tag in soup(['script', 'style', 'meta', 'link']):
+                tag.decompose()
 
-            # Search in common phone number containers
+            # Search for phone numbers
+            phone = self._find_phone_number(soup)
+            if phone:
+                self.stats['phone_numbers_found'] += 1
+                return phone
+
+            return None
+
+        except (ConnectionError, Timeout, HTTPError) as e:
+            self.logger.warning(f"Network error fetching {company_url}: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting phone from {company_url}: {e}")
+            self.stats['errors_encountered'] += 1
+            return None
+
+    def _find_phone_number(self, soup: BeautifulSoup) -> Optional[str]:
+        """Find phone number in parsed HTML."""
+        try:
+            # Enhanced phone number patterns
+            phone_patterns = [
+                r'\+?1?[-.\s]?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})',  # US format
+                r'\+?([1-9]\d{0,3})?[-.\s]?\(?(\d{1,4})\)?[-.\s]?(\d{1,4})[-.\s]?(\d{1,4})',  # International
+                r'(\d{3})-(\d{3})-(\d{4})',  # XXX-XXX-XXXX
+                r'(\d{3})\.(\d{3})\.(\d{4})',  # XXX.XXX.XXXX
+                r'\((\d{3})\)\s*(\d{3})-(\d{4})'  # (XXX) XXX-XXXX
+            ]
+
+            # Search in tel: links first (most reliable)
+            tel_links = soup.find_all('a', href=re.compile(r'^tel:'))
+            for link in tel_links:
+                phone = link.get('href').replace('tel:', '').strip()
+                if self._is_valid_phone(phone):
+                    return self._format_phone(phone)
+
+            # Search in specific elements
             phone_selectors = [
-                'a[href^="tel:"]',
                 '*[class*="phone"]',
+                '*[class*="telephone"]',
                 '*[class*="contact"]',
                 '*[id*="phone"]',
-                '*[id*="contact"]'
+                '*[id*="contact"]',
+                'footer',
+                '.contact-info',
+                '.header-contact'
             ]
 
             for selector in phone_selectors:
-                elements = soup.select(selector)
-                for element in elements:
-                    text = element.get_text(strip=True)
-                    if 'href' in element.attrs and element.attrs['href'].startswith('tel:'):
-                        # Extract from tel: link
-                        phone = element.attrs['href'].replace('tel:', '').strip()
-                        if self._is_valid_phone(phone):
-                            return phone
+                try:
+                    elements = soup.select(selector)
+                    for element in elements:
+                        text = element.get_text(strip=True)
+                        for pattern in phone_patterns:
+                            matches = re.findall(pattern, text)
+                            for match in matches:
+                                if isinstance(match, tuple):
+                                    phone = ''.join(match)
+                                else:
+                                    phone = match
 
-                    # Extract from text content
-                    matches = re.findall(phone_pattern, text)
-                    for match in matches:
-                        if self._is_valid_phone(match):
-                            return match.strip()
+                                if self._is_valid_phone(phone):
+                                    return self._format_phone(phone)
+                except:
+                    continue
 
-            # Fallback: search entire page text
-            page_text = soup.get_text()
-            matches = re.findall(phone_pattern, page_text)
-            for match in matches:
-                if self._is_valid_phone(match):
-                    return match.strip()
-
-            # No valid phone number found
             return None
 
         except Exception as e:
-            self.logger.error(f"Error extracting phone number for {company_url}: {str(e)}")
+            self.logger.error(f"Error finding phone number: {e}")
             return None
 
     def _is_valid_phone(self, phone: str) -> bool:
-        """
-        Validate if a phone number is reasonable.
+        """Enhanced phone number validation."""
+        if not phone:
+            return False
 
-        Args:
-            phone: Phone number string to validate
-
-        Returns:
-            Boolean indicating if phone number is valid
-        """
-        # Remove all non-digit characters
+        # Extract only digits
         digits = re.sub(r'\D', '', phone)
 
-        # Must have at least 7 digits and at most 15 (international standard)
+        # Length validation (7-15 digits per international standards)
         if len(digits) < 7 or len(digits) > 15:
             return False
 
-        # Avoid obviously invalid patterns
-        invalid_patterns = ['0000000', '1111111', '1234567', '7777777']
-        return digits not in invalid_patterns
-
-    def _should_try_alternative_patterns(self, verification_result: Dict[str, Any]) -> bool:
-        """
-        Determine if alternative patterns should be tried based on verification result.
-
-        Args:
-            verification_result: Result from email verification
-
-        Returns:
-            Boolean indicating if alternative patterns should be tried
-        """
-        # Get the result and handle None values properly
-        result = verification_result.get('result')
-        if result is None:
-            return False
-
-        # Convert to lowercase for comparison
-        result = result.lower()
-
-        # Try alternatives for hard bounces and undeliverable emails
-        # Based on Verimail API docs: deliverable, inbox_full, hardbounce, softbounce, catch_all, disposable, undeliverable
-        failure_indicators = [
-            'hardbounce',
-            'undeliverable'
+        # Reject obviously invalid patterns
+        invalid_patterns = [
+            '0000000', '1111111', '2222222', '3333333', '4444444',
+            '5555555', '6666666', '7777777', '8888888', '9999999',
+            '1234567', '7654321', '0123456', '9876543'
         ]
 
+        return digits not in invalid_patterns
+
+    def _format_phone(self, phone: str) -> str:
+        """Format phone number consistently."""
+        digits = re.sub(r'\D', '', phone)
+
+        if len(digits) == 10:
+            return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+        elif len(digits) == 11 and digits.startswith('1'):
+            return f"+1 ({digits[1:4]}) {digits[4:7]}-{digits[7:]}"
+        else:
+            return f"+{digits}"
+
+    def _should_try_alternative_patterns(self, verification_result: Dict[str, Any]) -> bool:
+        """Determine if alternative patterns should be tried."""
+        if not verification_result:
+            return False
+
+        result = verification_result.get('result', '').lower()
+
+        # Try alternatives for hard failures
+        failure_indicators = ['hardbounce', 'undeliverable', 'invalid']
         return result in failure_indicators
 
-    def _try_alternative_patterns(self, first_name: str, middle_name: str, last_name: str, company_url: str,
-                                current_pattern: str) -> Dict[str, Any]:
-        """
-        Try alternative email patterns if current pattern results in failure.
-
-        Args:
-            first_name: First name of the person
-            middle_name: Middle name of the person
-            last_name: Last name of the person
-            company_url: URL of the company
-            current_pattern: Current pattern that failed
-
-        Returns:
-            Dictionary with verification results and pattern attempts info
-        """
-        # Skip current pattern as it was already tried
+    def _try_alternative_patterns(self, first_name: str, middle_name: str, last_name: str,
+                                 company_url: str, current_pattern: str) -> Dict[str, Any]:
+        """Try alternative email patterns with rate limiting."""
         alternative_patterns = [p for p in self.standard_patterns if p != current_pattern]
-
-        # Track patterns attempted
         attempted_patterns = [current_pattern]
         attempts_count = 1
 
-        self.logger.info(f"Trying alternative patterns for {first_name} {last_name} at {company_url}")
+        self.logger.info(f"Trying alternative patterns for {first_name} {last_name}")
 
-        # Try each alternative pattern
         for pattern in alternative_patterns:
+            if attempts_count >= 5:  # Limit attempts to prevent abuse
+                break
+
             try:
                 email = self.generate_emails(first_name, middle_name, last_name, company_url, pattern)
+                if not email:
+                    continue
+
                 verification_result = self.verify_email(email)
                 attempted_patterns.append(pattern)
                 attempts_count += 1
 
-                # Log the attempt
                 self.logger.info(f"Pattern {pattern} -> {email} -> {verification_result.get('result', 'unknown')}")
 
-                # If we found a valid email or one that's not a hard failure, return it
+                # Return if we found a good result
                 if verification_result.get('valid', False) or \
                    not self._should_try_alternative_patterns(verification_result):
                     return {
@@ -544,15 +817,13 @@ class EmailVerifier:
                         "success": True
                     }
 
-                # Add delay between attempts to avoid rate limiting
-                time.sleep(random.uniform(1, 2))
+                # Rate limiting between attempts
+                time.sleep(random.uniform(1, 3))
 
             except Exception as e:
-                self.logger.error(f"Error trying pattern {pattern}: {str(e)}")
+                self.logger.error(f"Error trying pattern {pattern}: {e}")
                 continue
 
-        # If we get here, all patterns failed
-        self.logger.warning(f"All email patterns failed for {first_name} {last_name} at {company_url}")
         return {
             "email": None,
             "verification": None,
@@ -563,85 +834,87 @@ class EmailVerifier:
         }
 
     def _process_row(self, row: pd.Series, index: int) -> Tuple[int, Dict[str, Any]]:
-        """
-        Process a single row from the dataframe.
-
-        Args:
-            row: A pandas Series containing the row data
-            index: The original index of the row
-
-        Returns:
-            Tuple containing the original index and dictionary with processed data
-        """
+        """Process a single row with enhanced error handling."""
         result = row.to_dict()
 
         try:
-            # Parse full name
-            name = HumanName(row['Full Name'])
-            result['First Name'] = name.first
-            result['Middle Name'] = name.middle if name.middle else ""  # Handle None middle name
-            result['Last Name'] = name.last
+            # Validate required fields
+            if 'Full Name' not in row or pd.isna(row['Full Name']) or not str(row['Full Name']).strip():
+                raise ValueError("Missing or empty Full Name")
 
-            # Validate that we have both first and last names
+            if 'Company URL' not in row or pd.isna(row['Company URL']) or not str(row['Company URL']).strip():
+                raise ValueError("Missing or empty Company URL")
+
+            if 'Pattern' not in row or pd.isna(row['Pattern']) or not str(row['Pattern']).strip():
+                raise ValueError("Missing or empty Pattern")
+
+            # Parse and validate name
+            full_name = self.security_validator.sanitize_input(str(row['Full Name']), 200)
+            name = HumanName(full_name)
+
+            result['First Name'] = name.first or ""
+            result['Middle Name'] = name.middle or ""
+            result['Last Name'] = name.last or ""
+
             if not result['First Name'] or not result['Last Name']:
-                self.logger.warning(f"Missing name components for: {row['Full Name']}")
-                result['Email'] = None
-                result['Email Verification'] = False
-                result['Verification Status'] = "error"
-                result['Deliverable'] = False
-                result['Verification Result'] = "Missing name components"
-                result['Patterns Attempted'] = None
-                result['Patterns Count'] = 0
-                result['Phone Number'] = None
-                return (index, result)
+                raise ValueError("Could not parse first and last name")
 
-            # Generate initial email
+            # Validate company URL
+            company_url = self.security_validator.sanitize_input(str(row['Company URL']), 500)
+            if not self._extract_domain(company_url):
+                raise ValueError("Invalid company URL or unsafe domain")
+
+            # Generate email
+            pattern = self.security_validator.sanitize_input(str(row['Pattern']), 50)
             initial_email = self.generate_emails(
                 result['First Name'],
-                result['Middle Name'],  # Pass middle name (now guaranteed to be string)
+                result['Middle Name'],
                 result['Last Name'],
-                row['Company URL'],
-                row['Pattern']
+                company_url,
+                pattern
             )
+
+            if not initial_email:
+                raise ValueError("Could not generate email address")
+
             result['Email'] = initial_email
 
-            # Check if this name is in exception list
-            if self.validate_emails and row['Full Name'] in self.exception_names:
-                self.logger.info(f"Skipping verification for exception name: {row['Full Name']}")
+            # Handle verification
+            if self.validate_emails and full_name in self.exception_names:
+                # Skip verification for exception names
                 result['Email Verification'] = None
                 result['Verification Status'] = "skipped"
                 result['Deliverable'] = None
                 result['Verification Result'] = "Exception name"
-                result['Patterns Attempted'] = row['Pattern']
+                result['Patterns Attempted'] = pattern
                 result['Patterns Count'] = 1
-            # Verify email
+                result['Did You Mean'] = ""
+
             elif self.validate_emails:
+                # Verify email
                 verification_result = self.verify_email(initial_email)
 
-                # Check if we should try alternative patterns
+                # Try alternatives if needed
                 if self._should_try_alternative_patterns(verification_result):
-                    self.logger.info(f"Primary pattern failed for {initial_email}, trying alternatives")
+                    self.logger.info(f"Trying alternatives for {initial_email}")
 
                     retry_result = self._try_alternative_patterns(
                         result['First Name'],
-                        result['Middle Name'],  # Pass middle name
+                        result['Middle Name'],
                         result['Last Name'],
-                        row['Company URL'],
-                        row['Pattern']
+                        company_url,
+                        pattern
                     )
 
                     if retry_result['success']:
-                        # Update with successful pattern
                         result['Email'] = retry_result['email']
                         verification_result = retry_result['verification']
                         result['Pattern'] = retry_result['pattern_used']
 
-                    # Add retry information
                     result['Patterns Attempted'] = ', '.join(retry_result['patterns_attempted'])
                     result['Patterns Count'] = retry_result['attempts_count']
                 else:
-                    # No retry needed
-                    result['Patterns Attempted'] = row['Pattern']
+                    result['Patterns Attempted'] = pattern
                     result['Patterns Count'] = 1
 
                 # Store verification results
@@ -650,165 +923,271 @@ class EmailVerifier:
                 result['Deliverable'] = verification_result.get('deliverable')
                 result['Verification Result'] = verification_result.get('result', 'unknown')
                 result['Did You Mean'] = verification_result.get('did_you_mean', '')
+
             else:
-                # If not validating emails
+                # No verification
                 result['Email Verification'] = None
                 result['Verification Status'] = "not_verified"
                 result['Deliverable'] = None
                 result['Verification Result'] = "Validation disabled"
-                result['Patterns Attempted'] = row['Pattern']
+                result['Patterns Attempted'] = pattern
                 result['Patterns Count'] = 1
+                result['Did You Mean'] = ""
 
-            # Extract phone number
-            result['Phone Number'] = self.extract_phone_number(row['Company URL'])
+            # Extract phone number (with rate limiting built in)
+            try:
+                result['Phone Number'] = self.extract_phone_number(company_url)
+            except Exception as e:
+                self.logger.warning(f"Could not extract phone for {company_url}: {e}")
+                result['Phone Number'] = None
 
         except Exception as e:
-            self.logger.error(f"Error processing row {index}: {str(e)}")
+            self.logger.error(f"Error processing row {index}: {e}")
+            self.stats['errors_encountered'] += 1
+
+            # Set error values
             result['Email'] = None
             result['Email Verification'] = False
             result['Verification Status'] = "error"
             result['Deliverable'] = False
-            result['Verification Result'] = f"Processing error: {str(e)}"
+            result['Verification Result'] = f"Processing error: {str(e)[:100]}"
             result['Patterns Attempted'] = None
             result['Patterns Count'] = 0
             result['Phone Number'] = None
+            result['Did You Mean'] = ""
 
         return (index, result)
 
     def process_file(self, filename: str, progress_bar: tqdm) -> Optional[pd.DataFrame]:
-        """
-        Process a single Excel file.
-
-        Args:
-            filename: Name of the Excel file
-            progress_bar: tqdm progress bar
-
-        Returns:
-            Processed DataFrame or None if processing failed
-        """
+        """Process file with enhanced validation and security."""
         try:
-            # Read the excel file
-            df = pd.read_excel(filename)
+            # Validate filename
+            filename = self.security_validator.sanitize_input(filename, 255)
+            if not filename.endswith(('.xlsx', '.xls')):
+                self.logger.error(f"Invalid file type: {filename}")
+                return None
 
-            # Validate the columns in the dataframe
+            # Check file size (limit to 50MB)
+            if os.path.exists(filename):
+                file_size = os.path.getsize(filename)
+                if file_size > 50 * 1024 * 1024:  # 50MB
+                    self.logger.error(f"File too large: {filename} ({file_size} bytes)")
+                    return None
+
+            # Read with error handling
+            try:
+                df = pd.read_excel(filename, nrows=10000)  # Limit rows to prevent memory issues
+            except Exception as e:
+                self.logger.error(f"Error reading Excel file {filename}: {e}")
+                return None
+
+            # Validate columns
             required_columns = ['Full Name', 'Company URL', 'Pattern']
             missing_columns = set(required_columns) - set(df.columns)
+
             if missing_columns:
-                self.logger.error(f"Error: {filename} is missing required columns: {missing_columns}")
+                self.logger.error(f"Missing required columns in {filename}: {missing_columns}")
                 return None
 
-            # Validate data quality
+            # Data validation and cleaning
+            original_count = len(df)
+
+            # Remove rows with missing required data
             df = df.dropna(subset=required_columns)
+
+            # Remove duplicates
+            df = df.drop_duplicates(subset=['Full Name', 'Company URL'])
+
+            # Additional validation
+            df = df[df['Full Name'].str.len() >= 3]  # Minimum name length
+            df = df[df['Company URL'].str.len() >= 5]  # Minimum URL length
+
+            cleaned_count = len(df)
+            self.logger.info(f"File {filename}: {original_count} -> {cleaned_count} rows after cleaning")
+
             if df.empty:
-                self.logger.error(f"No valid data found in {filename}")
+                self.logger.warning(f"No valid data remaining in {filename}")
                 return None
 
-            # Process each row
+            # Process rows with controlled concurrency
             results = []
-            with ThreadPoolExecutor(max_workers=3) as executor:  # Reduced to avoid rate limiting
-                # Submit jobs with their original indices
-                futures = {executor.submit(self._process_row, row, i): i
-                          for i, (_, row) in enumerate(df.iterrows())}
+            max_workers = min(3, len(df))  # Limit workers to prevent rate limiting
 
-                # Create a list to store results with their original indices
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit jobs
+                futures = {
+                    executor.submit(self._process_row, row, i): i
+                    for i, (_, row) in enumerate(df.iterrows())
+                }
+
                 indexed_results = []
 
                 for future in as_completed(futures):
                     try:
-                        original_index, result = future.result()
+                        original_index, result = future.result(timeout=120)  # 2-minute timeout per row
                         indexed_results.append((original_index, result))
                     except Exception as e:
-                        self.logger.error(f"Error processing row: {str(e)}")
+                        self.logger.error(f"Timeout or error processing row: {e}")
+                        continue
 
-                # Sort results by original index to maintain original order
+                # Sort by original index
                 indexed_results.sort(key=lambda x: x[0])
-                # Extract just the results (without indices)
                 results = [result for _, result in indexed_results]
 
-            # Create a new DataFrame from the results
+            if not results:
+                self.logger.error(f"No results generated from {filename}")
+                return None
+
             processed_df = pd.DataFrame(results)
 
-            # Delete input file
+            # Clean up input file
             try:
                 os.remove(filename)
                 self.logger.info(f"Deleted input file: {filename}")
             except Exception as e:
-                self.logger.warning(f"Could not delete input file {filename}: {str(e)}")
+                self.logger.warning(f"Could not delete {filename}: {e}")
 
-            # Update progress bar
             progress_bar.update(1)
-
             return processed_df
 
         except Exception as e:
-            self.logger.error(f"Error processing file {filename}: {str(e)}")
+            self.logger.error(f"Error processing file {filename}: {e}")
+            self.stats['errors_encountered'] += 1
             return None
 
+    def _print_statistics(self) -> None:
+        """Print processing statistics."""
+        self.console.print("\n[cyan]Processing Statistics:")
+        self.console.print(f"• Emails generated: {self.stats['emails_generated']}")
+        self.console.print(f"• Emails verified: {self.stats['emails_verified']}")
+        self.console.print(f"• API calls made: {self.stats['api_calls_made']}")
+        self.console.print(f"• Phone numbers found: {self.stats['phone_numbers_found']}")
+        self.console.print(f"• Errors encountered: {self.stats['errors_encountered']}")
+
     def handle_batch_upload(self) -> None:
-        """
-        Handle batch upload of Excel files.
-        """
+        """Handle batch upload with enhanced security and error handling."""
         try:
-            # Prompt user to upload input Excel files
-            self.console.print("[cyan]Please upload the input Excel files:")
+            self.console.print("[cyan]Please upload Excel files (max 10 files, 50MB each):")
             uploaded_files = files.upload()
 
-            # Check if any files were uploaded
             if not uploaded_files:
-                self.console.print("[yellow]No files uploaded. Processing canceled.")
+                self.console.print("[yellow]No files uploaded.")
                 return
 
-            # Create an empty dataframe to hold aggregated results
+            # Validate number of files
+            if len(uploaded_files) > 10:
+                self.console.print("[red]Too many files. Maximum 10 files allowed.")
+                return
+
+            # Validate file types and sizes
+            valid_files = []
+            for filename, content in uploaded_files.items():
+                filename_clean = self.security_validator.sanitize_input(filename, 255)
+
+                if not filename_clean.endswith(('.xlsx', '.xls')):
+                    self.console.print(f"[yellow]Skipping invalid file type: {filename}")
+                    continue
+
+                if len(content) > 50 * 1024 * 1024:  # 50MB
+                    self.console.print(f"[yellow]Skipping large file: {filename}")
+                    continue
+
+                valid_files.append(filename_clean)
+
+            if not valid_files:
+                self.console.print("[red]No valid files to process.")
+                return
+
+            # Process files
             aggregated_df = pd.DataFrame()
+            progress_bar = tqdm(total=len(valid_files), desc="Processing files")
 
-            # Initialize tqdm progress bar
-            progress_bar = tqdm(total=len(uploaded_files), desc="Processing files")
+            for filename in valid_files:
+                try:
+                    processed_df = self.process_file(filename, progress_bar)
+                    if processed_df is not None and not processed_df.empty:
+                        aggregated_df = pd.concat([aggregated_df, processed_df], ignore_index=True)
+                except Exception as e:
+                    self.logger.error(f"Error processing {filename}: {e}")
+                    continue
 
-            # Process each uploaded file
-            for filename in uploaded_files:
-                processed_df = self.process_file(filename, progress_bar)
-                if processed_df is not None:
-                    aggregated_df = pd.concat([aggregated_df, processed_df], ignore_index=True)
-
-            # Close progress bar
             progress_bar.close()
 
-            # Check if any data was processed
             if aggregated_df.empty:
                 self.console.print("[red]No data was successfully processed.")
                 return
 
-            # Save the aggregated dataframe to a single output file
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            # Generate output filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_filename = f'Verified_Emails_{timestamp}.xlsx'
-            aggregated_df.to_excel(output_filename, index=False)
 
-            # Print summary statistics
-            total_rows = len(aggregated_df)
-            if self.validate_emails:
-                verified_emails = len(aggregated_df[aggregated_df['Email Verification'] == True])
-                self.console.print(f"[green]Summary: {verified_emails}/{total_rows} emails verified successfully")
-            else:
-                self.console.print(f"[green]Summary: {total_rows} emails generated (validation disabled)")
+            # Save with error handling
+            try:
+                with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+                    aggregated_df.to_excel(writer, index=False, sheet_name='Results')
 
-            # Download the output file
-            self.console.print(f"[green]Downloading output file: {output_filename}")
-            files.download(output_filename)
+                    # Add statistics sheet
+                    stats_df = pd.DataFrame([self.stats])
+                    stats_df.to_excel(writer, index=False, sheet_name='Statistics')
 
-            # Download the log file
-            if self.logger.handlers:
-                log_file = self.logger.handlers[0].baseFilename
-                self.console.print(f"[green]Downloading log file: {log_file}")
-                files.download(log_file)
+                self.console.print(f"[green]Output saved: {output_filename}")
 
-            self.console.print("[green]Batch processing completed successfully.")
+            except Exception as e:
+                self.logger.error(f"Error saving output: {e}")
+                self.console.print(f"[red]Error saving output: {e}")
+                return
+
+            # Print statistics
+            self._print_statistics()
+
+            # Download files
+            try:
+                files.download(output_filename)
+                self.console.print("[green]Output file downloaded successfully")
+            except Exception as e:
+                self.console.print(f"[yellow]Could not download output file: {e}")
+
+            # Download log file
+            try:
+                if self.logger.handlers:
+                    log_file = self.logger.handlers[0].baseFilename
+                    if os.path.exists(log_file):
+                        files.download(log_file)
+                        self.console.print("[green]Log file downloaded successfully")
+            except Exception as e:
+                self.console.print(f"[yellow]Could not download log file: {e}")
+
+            self.console.print("[green]Batch processing completed successfully!")
 
         except Exception as e:
-            self.logger.error(f"Error in batch processing: {str(e)}")
-            self.console.print(f"[red]An error occurred during batch processing: {str(e)}")
+            self.logger.error(f"Critical error in batch processing: {e}")
+            self.console.print(f"[red]Critical error occurred: {e}")
+
+        finally:
+            # Cleanup
+            try:
+                if hasattr(self, 'session'):
+                    self.session.close()
+            except:
+                pass
+
+    def __del__(self):
+        """Cleanup resources on destruction."""
+        try:
+            if hasattr(self, 'session'):
+                self.session.close()
+        except:
+            pass
 
 
-# Process batch upload
+# Main execution
 if __name__ == "__main__":
-    email_verifier = EmailVerifier()
-    email_verifier.handle_batch_upload()
+    try:
+        email_verifier = EmailVerifier()
+        email_verifier.handle_batch_upload()
+    except KeyboardInterrupt:
+        print("\n[yellow]Process interrupted by user.")
+    except Exception as e:
+        print(f"[red]Fatal error: {e}")
+    finally:
+        print("[cyan]Program terminated.")
